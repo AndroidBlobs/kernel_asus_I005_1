@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2019-2020, The Linux Foundation. All rights reserved.
@@ -7,7 +8,7 @@
 
 #include <linux/debugfs.h>
 #include <linux/delay.h>
-#include <linux/device.h>
+//#include <linux/device.h> //ASUS_BSP : Move to battery_charger.h
 #include <linux/firmware.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -18,7 +19,7 @@
 #include <linux/pm_wakeup.h>
 #include <linux/power_supply.h>
 #include <linux/soc/qcom/pmic_glink.h>
-#include <linux/soc/qcom/battery_charger.h>
+#include <linux/soc/qcom/battery_charger_asus.h>
 
 #define MSG_OWNER_BC			32778
 #define MSG_TYPE_REQ_RESP		1
@@ -51,12 +52,29 @@
 #define WLS_FW_BUF_SIZE			128
 #define DEFAULT_RESTRICT_FCC_UA		1000000
 
+extern bool g_vbus_plug;
+extern bool feature_stop_chg_flag;
+extern bool bFactoryChgLimit;
+extern bool smartchg_stop_flag;
+extern bool g_once_usb_thermal_btm;
+extern bool g_once_usb_thermal_side;
+extern void qti_charge_notify_device_charge(void);
+extern void qti_charge_notify_device_not_charge(void);
+extern void get_cc_status_from_ADSP(void);
+extern int rt_chg_get_remote_cc(void);
+extern bool side_port_cc_status;
+extern bool g_Charger_mode;
+extern bool g_IsBootComplete;
+
+//Move to battery_charger.h
+#if 0
 enum psy_type {
 	PSY_TYPE_BATTERY,
 	PSY_TYPE_USB,
 	PSY_TYPE_WLS,
 	PSY_TYPE_MAX,
 };
+#endif
 
 enum ship_mode_type {
 	SHIP_MODE_PMIC,
@@ -201,6 +219,9 @@ struct battery_charger_ship_mode_req_msg {
 	u32			ship_mode_type;
 };
 
+//ASUS_BSP : Move battery_chg_dev to battery_charger.h
+struct battery_chg_dev *g_bcdev;
+#if 0
 struct psy_state {
 	struct power_supply	*psy;
 	char			*model;
@@ -244,7 +265,7 @@ struct battery_chg_dev {
 	/* To track the driver initialization status */
 	bool				initialized;
 };
-
+#endif
 static const int battery_prop_map[BATT_PROP_MAX] = {
 	[BATT_STATUS]		= POWER_SUPPLY_PROP_STATUS,
 	[BATT_HEALTH]		= POWER_SUPPLY_PROP_HEALTH,
@@ -326,7 +347,10 @@ static int battery_chg_fw_write(struct battery_chg_dev *bcdev, void *data,
 	return rc;
 }
 
-static int battery_chg_write(struct battery_chg_dev *bcdev, void *data,
+//ASUS_BSP : remove the static use of battery_chg_write
+//static int battery_chg_write(struct battery_chg_dev *bcdev, void *data,
+//				int len)
+int battery_chg_write(struct battery_chg_dev *bcdev, void *data,
 				int len)
 {
 	int rc;
@@ -427,6 +451,14 @@ static void battery_chg_notify_enable(struct battery_chg_dev *bcdev)
 	rc = battery_chg_write(bcdev, &req_msg, sizeof(req_msg));
 	if (rc < 0)
 		pr_err("Failed to enable notification rc=%d\n", rc);
+}
+
+static void battery_chg_subsys_up_work(struct work_struct *work)
+{
+	struct battery_chg_dev *bcdev = container_of(work,
+					struct battery_chg_dev, subsys_up_work);
+
+	battery_chg_notify_enable(bcdev);
 }
 
 static void battery_chg_state_cb(void *priv, enum pmic_glink_state state)
@@ -639,13 +671,18 @@ static void battery_chg_update_usb_type_work(struct work_struct *work)
 		return;
 	}
 
-	/* Reset usb_icl_ua whenever USB adapter type changes */
-	if (pst->prop[USB_ADAP_TYPE] != POWER_SUPPLY_USB_TYPE_SDP &&
-	    pst->prop[USB_ADAP_TYPE] != POWER_SUPPLY_USB_TYPE_PD)
-		bcdev->usb_icl_ua = 0;
-
 	pr_debug("usb_adap_type: %u\n", pst->prop[USB_ADAP_TYPE]);
 
+	//[+++]ASUS_BSP : Move this notification to asus_battery_charger.c
+	#if 0
+	if (pst->prop[USB_ONLINE]) {
+	    qti_charge_notify_device_charge();
+	} else if (!pst->prop[USB_ONLINE]) {
+	    qti_charge_notify_device_not_charge();
+	}
+	#endif
+	//[---]ASUS_BSP : Move this notification to asus_battery_charger.c
+	
 	switch (pst->prop[USB_ADAP_TYPE]) {
 	case POWER_SUPPLY_USB_TYPE_SDP:
 		usb_psy_desc.type = POWER_SUPPLY_TYPE_USB;
@@ -716,7 +753,11 @@ static void handle_notification(struct battery_chg_dev *bcdev, void *data,
 		 * unplugged).
 		 */
 		power_supply_changed(pst->psy);
-		pm_wakeup_dev_event(bcdev->dev, 50, true);
+		if (g_Charger_mode && notify_msg->notification == BC_USB_STATUS_GET) {
+			pm_wakeup_dev_event(bcdev->dev, 5000, true);
+		} else {
+			pm_wakeup_dev_event(bcdev->dev, 50, true);
+		}
 	}
 }
 
@@ -727,12 +768,6 @@ static int battery_chg_callback(void *priv, void *data, size_t len)
 
 	pr_debug("owner: %u type: %u opcode: %#x len: %zu\n", hdr->owner,
 		hdr->type, hdr->opcode, len);
-
-	if (!bcdev->initialized) {
-		pr_debug("Driver initialization failed: Dropping glink callback message: state %d\n",
-			 bcdev->state);
-		return 0;
-	}
 
 	if (hdr->opcode == BC_NOTIFY_IND)
 		handle_notification(bcdev, data, len);
@@ -883,7 +918,17 @@ static int usb_psy_get_prop(struct power_supply *psy,
 
 	pval->intval = pst->prop[prop_id];
 	if (prop == POWER_SUPPLY_PROP_TEMP)
-		pval->intval = DIV_ROUND_CLOSEST((int)pval->intval, 10);
+		pval->intval = pval->intval - 2731; // ASUS_BSP: change 0.1K to 0.1C
+		// pval->intval = DIV_ROUND_CLOSEST((int)pval->intval, 10);
+	if (prop == POWER_SUPPLY_PROP_ONLINE && pval->intval == 0) {	// ASUS BSP: set online = 1 when feature usbin_suspend with cable
+		get_cc_status_from_ADSP();
+		if (side_port_cc_status || (rt_chg_get_remote_cc() == 1)) {
+			pr_err("[BAT][CHG] USB_ONLINE=0, but side_cc=%d, btm_cc=%d\n", side_port_cc_status, rt_chg_get_remote_cc());
+			pval->intval = 1;
+		} else if (g_vbus_plug && (feature_stop_chg_flag | g_once_usb_thermal_btm | g_once_usb_thermal_side)) {
+			pval->intval = 1;
+		}
+	}
 
 	return 0;
 }
@@ -1022,6 +1067,8 @@ static int battery_psy_get_prop(struct power_supply *psy,
 	struct battery_chg_dev *bcdev = power_supply_get_drvdata(psy);
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
 	int prop_id, rc;
+	static int prop_cache[32] = {0};
+	static char model_name[32] = {0};
 
 	pval->intval = -ENODATA;
 
@@ -1031,11 +1078,25 @@ static int battery_psy_get_prop(struct power_supply *psy,
 
 	rc = read_property_id(bcdev, pst, prop_id);
 	if (rc < 0)
-		return rc;
+	{
+		if (prop_cache[prop_id] != 0 && prop_id != 18)
+		{
+			pval->intval = prop_cache[prop_id];
+			pr_err("battery_psy_get_prop error: Use cache prop_cache[prop_id]: %d, prop_id: %d\n", prop_cache[prop_id], prop_id);
+		}
+
+		if (prop_id == 18)
+		{
+			pval->strval = model_name;
+			pr_err("battery_psy_get_prop error: Use cache pval->strval]: %s, prop_id: %d\n", pval->strval, prop_id);
+		}
+		return 0;
+	}
 
 	switch (prop) {
 	case POWER_SUPPLY_PROP_MODEL_NAME:
 		pval->strval = pst->model;
+		strcpy(model_name, pst->model);
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
 		pval->intval = DIV_ROUND_CLOSEST(pst->prop[prop_id], 100);
@@ -1044,7 +1105,17 @@ static int battery_psy_get_prop(struct power_supply *psy,
 			pval->intval = bcdev->fake_soc;
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
-		pval->intval = DIV_ROUND_CLOSEST((int)pst->prop[prop_id], 10);
+#if defined ASUS_SAKE_PROJECT || defined ASUS_VODKA_PROJECT
+		if(g_ASUS_hwID <= HW_REV_EVB2) {
+			pr_err("debug: real temp:%d\n", DIV_ROUND_CLOSEST((int)pst->prop[prop_id], 10));
+			pval->intval = 250;
+		} else {
+			pval->intval = DIV_ROUND_CLOSEST((int)pst->prop[prop_id], 10);
+		}
+#else
+		pval->intval = pst->prop[prop_id] - 2731; // ASUS_BSP: change 0.1K to 0.1C
+		// pval->intval = DIV_ROUND_CLOSEST((int)pst->prop[prop_id], 10);
+#endif
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 		pval->intval = bcdev->curr_thermal_level;
@@ -1052,15 +1123,37 @@ static int battery_psy_get_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX:
 		pval->intval = bcdev->num_thermal_levels;
 		break;
-#if defined ASUS_ZS673KS_PROJECT || defined ASUS_PICASSO_PROJECT
 	case POWER_SUPPLY_PROP_STATUS:
 		pval->intval = pst->prop[prop_id];
-		set_qc_stat(pval->intval);
-		break;		
-#endif
+		if (g_Charger_mode == 0 && g_IsBootComplete == 1)
+			set_qc_stat(pval->intval);
+		else if (g_Charger_mode == 1)
+			set_qc_stat(pval->intval);
+		break;
 	default:
 		pval->intval = pst->prop[prop_id];
 		break;
+	}
+	prop_cache[prop_id] = pval->intval;
+	if(g_ASUS_hwID > HW_REV_ER && strcmp(model_name, "default") == 0)
+	{
+		switch (prop) {
+		case POWER_SUPPLY_PROP_CAPACITY:
+			pval->intval = 85;
+			break;
+		case POWER_SUPPLY_PROP_TEMP:
+			pval->intval = 250;
+			break;
+		case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+			pval->intval = 8000000;
+			break;
+		case POWER_SUPPLY_PROP_CURRENT_NOW:
+			pval->intval = 200000;
+			break;
+		default:
+			break;
+		}
+
 	}
 
 	return rc;
@@ -1074,6 +1167,10 @@ static int battery_psy_set_prop(struct power_supply *psy,
 
 	switch (prop) {
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+        #ifdef ASUS_ZS673KS_PROJECT
+            printk(KERN_ERR "[HLOS][CHG]Avoid kernel to set FCC temporary\n");
+            return 0;
+        #endif
 		return battery_psy_set_charge_current(bcdev, pval->intval);
 	default:
 		return -EINVAL;
@@ -1165,38 +1262,6 @@ static int battery_chg_init_psy(struct battery_chg_dev *bcdev)
 	return 0;
 }
 
-static void battery_chg_subsys_up_work(struct work_struct *work)
-{
-	struct battery_chg_dev *bcdev = container_of(work,
-					struct battery_chg_dev, subsys_up_work);
-	int rc;
-
-	battery_chg_notify_enable(bcdev);
-
-	/*
-	 * Give some time after enabling notification so that USB adapter type
-	 * information can be obtained properly which is essential for setting
-	 * USB ICL.
-	 */
-	msleep(200);
-
-	if (bcdev->last_fcc_ua) {
-		rc = __battery_psy_set_charge_current(bcdev,
-				bcdev->last_fcc_ua);
-		if (rc < 0)
-			pr_err("Failed to set FCC (%u uA), rc=%d\n",
-				bcdev->last_fcc_ua, rc);
-	}
-
-	if (bcdev->usb_icl_ua) {
-		rc = usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT,
-				bcdev->usb_icl_ua);
-		if (rc < 0)
-			pr_err("Failed to set ICL(%u uA), rc=%d\n",
-				bcdev->usb_icl_ua, rc);
-	}
-}
-
 static int wireless_fw_send_firmware(struct battery_chg_dev *bcdev,
 					const struct firmware *fw)
 {
@@ -1254,7 +1319,6 @@ static int wireless_fw_check_for_update(struct battery_chg_dev *bcdev,
 	req_msg.hdr.opcode = BC_WLS_FW_CHECK_UPDATE;
 	req_msg.fw_version = version;
 	req_msg.fw_size = size;
-	req_msg.fw_crc = bcdev->wls_fw_crc;
 
 	return battery_chg_write(bcdev, &req_msg, sizeof(req_msg));
 }
@@ -1342,7 +1406,7 @@ static int wireless_fw_update(struct battery_chg_dev *bcdev, bool force)
 	}
 
 	rc = wait_for_completion_timeout(&bcdev->fw_update_ack,
-				msecs_to_jiffies(WLS_FW_UPDATE_TIME_MS));
+				msecs_to_jiffies(WLS_FW_WAIT_TIME_MS));
 	if (!rc) {
 		pr_err("Error, timed out updating firmware\n");
 		rc = -ETIMEDOUT;
@@ -1354,30 +1418,12 @@ static int wireless_fw_update(struct battery_chg_dev *bcdev, bool force)
 	pr_info("Wireless FW update done\n");
 
 release_fw:
-	bcdev->wls_fw_crc = 0;
 	release_firmware(fw);
 out:
 	pm_relax(bcdev->dev);
 
 	return rc;
 }
-
-static ssize_t wireless_fw_crc_store(struct class *c,
-					struct class_attribute *attr,
-					const char *buf, size_t count)
-{
-	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
-						battery_class);
-	u16 val;
-
-	if (kstrtou16(buf, 0, &val) || !val)
-		return -EINVAL;
-
-	bcdev->wls_fw_crc = val;
-
-	return count;
-}
-static CLASS_ATTR_WO(wireless_fw_crc);
 
 static ssize_t wireless_fw_version_show(struct class *c,
 					struct class_attribute *attr,
@@ -1724,7 +1770,6 @@ static struct attribute *battery_class_attrs[] = {
 	&class_attr_wireless_fw_update.attr,
 	&class_attr_wireless_fw_force_update.attr,
 	&class_attr_wireless_fw_version.attr,
-	&class_attr_wireless_fw_crc.attr,
 	&class_attr_ship_mode_en.attr,
 	&class_attr_restrict_chg.attr,
 	&class_attr_restrict_cur.attr,
@@ -1784,11 +1829,8 @@ static int battery_chg_parse_dt(struct battery_chg_dev *bcdev)
 	len = rc;
 
 	rc = read_property_id(bcdev, pst, BATT_CHG_CTRL_LIM_MAX);
-	if (rc < 0) {
-		pr_err("Failed to read prop BATT_CHG_CTRL_LIM_MAX, rc=%d\n",
-			rc);
+	if (rc < 0)
 		return rc;
-	}
 
 	prev = pst->prop[BATT_CHG_CTRL_LIM_MAX];
 
@@ -1876,6 +1918,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 	struct pmic_glink_client_data client_data = { };
 	int rc, i;
 
+	pr_info("%s +++\n", __func__);
 	bcdev = devm_kzalloc(&pdev->dev, sizeof(*bcdev), GFP_KERNEL);
 	if (!bcdev)
 		return -ENOMEM;
@@ -1930,20 +1973,18 @@ static int battery_chg_probe(struct platform_device *pdev)
 		return rc;
 	}
 
-	bcdev->initialized = true;
 	bcdev->reboot_notifier.notifier_call = battery_chg_ship_mode;
 	bcdev->reboot_notifier.priority = 255;
 	register_reboot_notifier(&bcdev->reboot_notifier);
 
 	rc = battery_chg_parse_dt(bcdev);
-	if (rc < 0) {
-		dev_err(dev, "Failed to parse dt rc=%d\n", rc);
+	if (rc < 0)
 		goto error;
-	}
 
 	bcdev->restrict_fcc_ua = DEFAULT_RESTRICT_FCC_UA;
 	platform_set_drvdata(pdev, bcdev);
 	bcdev->fake_soc = -EINVAL;
+	pr_info("battery_chg_init_psy finish\n");
 	rc = battery_chg_init_psy(bcdev);
 	if (rc < 0)
 		goto error;
@@ -1952,18 +1993,24 @@ static int battery_chg_probe(struct platform_device *pdev)
 	bcdev->battery_class.class_groups = battery_class_groups;
 	rc = class_register(&bcdev->battery_class);
 	if (rc < 0) {
-		dev_err(dev, "Failed to create battery_class rc=%d\n", rc);
+		pr_err("Failed to create battery_class rc=%d\n", rc);
 		goto error;
 	}
 
 	battery_chg_add_debugfs(bcdev);
 	battery_chg_notify_enable(bcdev);
 	device_init_wakeup(bcdev->dev, true);
-
+	pr_info("%s ---\n", __func__);
+	//[+++]ASUS_BSP : Add for OEM sub-function
+	g_bcdev = bcdev;
+#if defined ASUS_SAKE_PROJECT || defined ASUS_VODKA_PROJECT
+	asuslib_init();
+#else
+	asuslib_init();
+#endif
+	//[+++]ASUS_BSP : Add for OEM sub-function
 	return 0;
 error:
-	bcdev->initialized = false;
-	complete(&bcdev->ack);
 	pmic_glink_unregister_client(bcdev->client);
 	unregister_reboot_notifier(&bcdev->reboot_notifier);
 	return rc;
@@ -1978,6 +2025,12 @@ static int battery_chg_remove(struct platform_device *pdev)
 	debugfs_remove_recursive(bcdev->debugfs_dir);
 	class_unregister(&bcdev->battery_class);
 	unregister_reboot_notifier(&bcdev->reboot_notifier);
+
+#if defined ASUS_SAKE_PROJECT || defined ASUS_VODKA_PROJECT
+
+#else
+	asuslib_deinit();//ASUS_BSP : Add for sub-function
+#endif
 	rc = pmic_glink_unregister_client(bcdev->client);
 	if (rc < 0) {
 		pr_err("Error unregistering from pmic_glink, rc=%d\n", rc);
@@ -1992,19 +2045,14 @@ static const struct of_device_id battery_chg_match_table[] = {
 	{},
 };
 
-#if 0 // defined ASUS_ZS673KS_PROJECT || defined ASUS_PICASSO_PROJECT
 static const struct dev_pm_ops asus_chg_pm_ops = {
 	.resume		= asus_chg_resume,
 };
-#endif
-
 static struct platform_driver battery_chg_driver = {
 	.driver = {
 		.name = "qti_battery_charger",
 		.of_match_table = battery_chg_match_table,
-#if 0 // defined ASUS_ZS673KS_PROJECT || defined ASUS_PICASSO_PROJECT
 		.pm	= &asus_chg_pm_ops,
-#endif
 	},
 	.probe = battery_chg_probe,
 	.remove = battery_chg_remove,
