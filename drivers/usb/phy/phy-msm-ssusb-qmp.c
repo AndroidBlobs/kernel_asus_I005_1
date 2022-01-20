@@ -370,6 +370,51 @@ static void msm_ssphy_qmp_setmode(struct msm_ssphy_qmp *phy, u32 mode)
 	readl_relaxed(phy->base + phy->phy_reg[USB3_DP_COM_PHY_MODE_CTRL]);
 }
 
+static void usb_qmp_update_hw_portselect(struct msm_ssphy_qmp *phy)
+{
+	struct pinctrl		*portselect_pinctrl;
+	struct pinctrl_state	*portselect_state;
+	u32 status;
+
+	if (phy->phy.dev->pins) {
+		portselect_pinctrl = phy->phy.dev->pins->p;
+		portselect_state = phy->phy.dev->pins->default_state;
+	} else {
+		portselect_pinctrl = pinctrl_get(phy->phy.dev);
+		if (IS_ERR_OR_NULL(portselect_pinctrl)) {
+			dev_dbg(phy->phy.dev, "failed to get pinctrl\n");
+			return;
+		}
+
+		portselect_state =
+			pinctrl_lookup_state(portselect_pinctrl, "portselect");
+		if (IS_ERR_OR_NULL(portselect_state)) {
+			dev_dbg(phy->phy.dev,
+				"failed to find portselect state\n");
+			pinctrl_put(portselect_pinctrl);
+			return;
+		}
+	}
+
+	writel_relaxed(0x01,
+		phy->base + phy->phy_reg[USB3_DP_COM_SW_RESET]);
+
+	pinctrl_select_state(portselect_pinctrl, portselect_state);
+
+	writel_relaxed(0x00,
+		phy->base + phy->phy_reg[USB3_DP_COM_SW_RESET]);
+
+	if (!phy->phy.dev->pins)
+		pinctrl_put(portselect_pinctrl);
+
+	if (phy->phy_reg[USB3_DP_COM_TYPEC_STATUS]) {
+		status = readl_relaxed(phy->base +
+				phy->phy_reg[USB3_DP_COM_TYPEC_STATUS]);
+		dev_dbg(phy->phy.dev, "hw port select %s\n",
+			status & PORTSELECT_RAW ? "CC2" : "CC1");
+	}
+}
+
 static void usb_qmp_update_portselect_phymode(struct msm_ssphy_qmp *phy)
 {
 	int val;
@@ -386,16 +431,7 @@ static void usb_qmp_update_portselect_phymode(struct msm_ssphy_qmp *phy)
 
 	switch (phy->phy_type) {
 	case USB3_AND_DP:
-		if (phy->phy.dev->pins) {
-			writel_relaxed(0x01,
-				phy->base + phy->phy_reg[USB3_DP_COM_SW_RESET]);
-
-			pinctrl_select_state(phy->phy.dev->pins->p,
-					phy->phy.dev->pins->default_state);
-
-			writel_relaxed(0x00,
-				phy->base + phy->phy_reg[USB3_DP_COM_SW_RESET]);
-		}
+		usb_qmp_update_hw_portselect(phy);
 
 		/* override hardware control for reset of qmp phy */
 		writel_relaxed(SW_DPPHY_RESET_MUX | SW_DPPHY_RESET |
@@ -864,6 +900,53 @@ static void msm_ssphy_qmp_enable_clks(struct msm_ssphy_qmp *phy, bool on)
 	}
 }
 
+static unsigned int reg_offset;
+
+static ssize_t tune_reg_show(struct device *dev, struct device_attribute *attr,
+		char *buf)
+{
+	struct msm_ssphy_qmp *phy = dev_get_drvdata(dev);
+	u32 reg_value;
+
+	reg_value = readl_relaxed(phy->base + reg_offset);
+
+	dev_info(dev, "reg_value=0x%x\n", reg_value);
+
+	return snprintf(buf, PAGE_SIZE, "0x%x\n", (u8)reg_value);
+}
+
+static ssize_t tune_reg_store(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	int ret;
+	struct qmp_reg_val *reg;
+	struct msm_ssphy_qmp *phy = dev_get_drvdata(dev);
+	u32 reg_value;
+
+	ret = sscanf(buf, "%x %x", &reg_offset, &reg_value);
+
+	if (ret == 1) {
+		dev_info(dev, "reg_offset=0x%x\n", reg_offset);
+	} else if (ret == 2) {
+
+		reg = (struct qmp_reg_val *)phy->qmp_phy_init_seq;
+
+		while (reg->offset != -1) {
+			if (reg->offset == reg_offset) {
+				reg->val = reg_value;
+				break;
+			}
+			reg++;
+		}
+
+		dev_info(dev, "reg_offset=0x%x reg_value=0x%x\n", reg->offset, reg->val);
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(tune_reg);
+
 static int msm_ssphy_qmp_probe(struct platform_device *pdev)
 {
 	struct msm_ssphy_qmp *phy;
@@ -1003,6 +1086,7 @@ static int msm_ssphy_qmp_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
+
 	/* Set default core voltage values */
 	phy->core_voltage_levels[CORE_LEVEL_NONE] = 0;
 	phy->core_voltage_levels[CORE_LEVEL_MIN] = USB_SSPHY_1P2_VOL_MIN;
@@ -1066,6 +1150,7 @@ static int msm_ssphy_qmp_probe(struct platform_device *pdev)
 	phy->phy.notify_connect		= msm_ssphy_qmp_notify_connect;
 	phy->phy.notify_disconnect	= msm_ssphy_qmp_notify_disconnect;
 
+	device_create_file(&pdev->dev, &dev_attr_tune_reg);
 	ret = usb_add_phy_dev(&phy->phy);
 
 err:
