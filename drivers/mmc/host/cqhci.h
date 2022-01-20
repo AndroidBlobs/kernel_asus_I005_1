@@ -45,11 +45,8 @@
 #define CQHCI_IS_TCC			BIT(1)
 #define CQHCI_IS_RED			BIT(2)
 #define CQHCI_IS_TCL			BIT(3)
-#define CQHCI_IS_GCE			BIT(4)
-#define CQHCI_IS_ICCE			BIT(5)
 
-#define CQHCI_IS_MASK (CQHCI_IS_TCC | CQHCI_IS_RED | \
-			CQHCI_IS_GCE | CQHCI_IS_ICCE)
+#define CQHCI_IS_MASK (CQHCI_IS_TCC | CQHCI_IS_RED)
 
 /* interrupt status enable */
 #define CQHCI_ISTE			0x14
@@ -310,13 +307,17 @@ struct cqhci_host {
 	struct cqhci_slot *slot;
 	const struct cqhci_host_crypto_variant_ops *crypto_vops;
 
+#ifdef CONFIG_MMC_CQHCI_CRYPTO
 	union cqhci_crypto_capabilities crypto_capabilities;
 	union cqhci_crypto_cap_entry *crypto_cap_array;
 	u32 crypto_cfg_register;
 #ifdef CONFIG_BLK_INLINE_ENCRYPTION
 	struct keyslot_manager *ksm;
 #endif /* CONFIG_BLK_INLINE_ENCRYPTION */
+#endif /* CONFIG_MMC_CQHCI_CRYPTO */
+#ifdef CONFIG_MMC_CQHCI_CRYPTO_QTI
 	struct platform_device *pdev;
+#endif /* CONFIG_MMC_CQHCI_CRYPTO_QTI */
 };
 
 struct cqhci_host_ops {
