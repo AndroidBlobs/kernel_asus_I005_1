@@ -72,6 +72,21 @@ enum gsi_ep_op {
  * @sgt_data_buff: Data buffer related sgtable entries
  * @dev: pointer to the DMA-capable dwc device
  */
+#if defined ASUS_ZS673KS_PROJECT || defined ASUS_PICASSO_PROJECT 
+ struct usb_gsi_request {
+	void *buf_base_addr;
+	dma_addr_t dma;
+	size_t num_bufs;
+	size_t buf_len;
+	u32 db_reg_phs_addr_lsb;
+	dma_addr_t mapped_db_reg_phs_addr_lsb;
+	u32 db_reg_phs_addr_msb;
+	u8 ep_intr_num;
+	struct sg_table sgt_trb_xfer_ring;
+	struct sg_table sgt_data_buff;
+	struct device *dev;	
+};
+#else
 struct usb_gsi_request {
 	void *buf_base_addr;
 	dma_addr_t dma;
@@ -85,7 +100,7 @@ struct usb_gsi_request {
 	struct sg_table sgt_data_buff;
 	struct device *dev;
 };
-
+#endif
 /*
  * @last_trb_addr: Address (LSB - based on alignment restrictions) of
  *	last TRB in queue. Used to identify rollover case.
@@ -136,7 +151,6 @@ int msm_data_fifo_config(struct usb_ep *ep, unsigned long addr, u32 size,
 bool msm_dwc3_reset_ep_after_lpm(struct usb_gadget *gadget);
 int msm_dwc3_reset_dbm_ep(struct usb_ep *ep);
 int dwc3_msm_release_ss_lane(struct device *dev);
-bool usb_get_remote_wakeup_status(struct usb_gadget *gadget);
 #else
 static inline struct usb_ep *usb_ep_autoconfig_by_name(
 		struct usb_gadget *gadget, struct usb_endpoint_descriptor *desc,
@@ -164,8 +178,6 @@ static inline int msm_dwc3_reset_dbm_ep(struct usb_ep *ep)
 { return -ENODEV; }
 static inline int dwc3_msm_release_ss_lane(struct device *dev)
 { return -ENODEV; }
-static bool __maybe_unused usb_get_remote_wakeup_status(struct usb_gadget *gadget)
-{ return false; }
 #endif
 
 #endif /* __LINUX_USB_DWC3_MSM_H */
