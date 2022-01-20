@@ -194,15 +194,6 @@ config QCOM_SHIMA_LLCC
 	  can start using the LLCC slices.
 	  If unsure, say n.
 
-config QCOM_YUPIK_LLCC
-	tristate "Qualcomm Technologies, Inc. YUPIK LLCC driver"
-	depends on QCOM_LLCC
-	help
-	  Say y or m here to enable the LLCC driver for Yupik platform.
-	  This provides data required to configure LLCC so that clients
-	  can start using the LLCC slices.
-	  If unsure, say n.
-
 config QCOM_SDM845_LLCC
 	tristate "Qualcomm Technologies, Inc. SDM845 LLCC driver"
 	depends on QCOM_LLCC
@@ -609,26 +600,6 @@ config MSM_PERFORMANCE
           fmin and fmax. The user space can request  the cpu freq change by
           writing cpu#:freq values
 
-config QTI_PLH
-	bool "Qualcomm Technologies Inc. RIMPS PLH interface"
-	depends on ARM_SCMI_PROTOCOL && MSM_PERFORMANCE
-	default n
-	help
-	  Interface between RIMPS PLH and userspace.
-
-	  This interface is responsible for handling the communication
-	  with RIMPS PLH such as passing tunables, enable and disable.
-
-config MSM_PERFORMANCE_QGKI
-	bool "Enable QGKI features"
-        depends on QGKI
-        help
-          This option enables full functionality of MSM_PERFORMANCE for
-          QGKI flavor. This is not defined in GKI builds wherein the driver
-          offers minimal functionality of changing the min and max frequency
-          of a given cluster. The user space can request  the cpu freq change
-          by writing cpu#:freq values
-
 config QMP_DEBUGFS_CLIENT
 	bool "Debugfs Client to communicate with AOP using QMP protocol"
 	depends on DEBUG_FS
@@ -999,8 +970,8 @@ config QCOM_WDOG_BITE_EARLY_PANIC
 config QCOM_WATCHDOG_BARK_TIME
 	depends on QCOM_WDT_CORE
 	int "Qualcomm Technologies, Inc. Watchdog bark time in ms"
-	default 11000
-	range 11000 11000
+	default 22000
+	range 22000 22000
 	help
 	  The amount of time, in milliseconds, that should elapse after
 	  a watchdog timer reset before a bark interrupt is sent from the
