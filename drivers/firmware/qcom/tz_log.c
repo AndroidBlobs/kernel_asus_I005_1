@@ -20,6 +20,16 @@
 #include <soc/qcom/qseecomi.h>
 #include <linux/qtee_shmbridge.h>
 
+#ifdef CONFIG_DEBUG_FS
+#undef CONFIG_DEBUG_FS
+#endif
+
+#ifndef CONFIG_DEBUG_FS
+#include <linux/proc_fs.h>
+static struct proc_dir_entry *tzdbg_root;
+#define TZDBG_ROOT_DIR "tzdbg"
+#endif
+
 /* QSEE_LOG_BUF_SIZE = 32K */
 #define QSEE_LOG_BUF_SIZE 0x8000
 
@@ -35,7 +45,6 @@
 #define TZBSP_FVER_MINOR_SHIFT          12
 #define TZBSP_DIAG_MAJOR_VERSION_V9     9
 #define TZBSP_DIAG_MINOR_VERSION_V2     2
-#define TZBSP_DIAG_MINOR_VERSION_V21     3
 
 /* TZ Diag Feature Version Id */
 #define QCOM_SCM_FEAT_DIAG_ID           0x06
@@ -192,34 +201,6 @@ struct tzdbg_log_v2_t {
 	uint8_t					log_buf[];
 };
 
-struct tzbsp_encr_info_for_log_chunk_t {
-	uint32_t size_to_encr;
-	uint8_t nonce[TZBSP_NONCE_LEN];
-	uint8_t tag[TZBSP_TAG_LEN];
-};
-
-/*
- * Only `ENTIRE_LOG` will be used unless the
- * "OEM_tz_num_of_diag_log_chunks_to_encr" devcfg field >= 2.
- * If this is true, the diag log will be encrypted in two
- * separate chunks: a smaller chunk containing only error
- * fatal logs and a bigger "rest of the log" chunk. In this
- * case, `ERR_FATAL_LOG_CHUNK` and `BIG_LOG_CHUNK` will be
- * used instead of `ENTIRE_LOG`.
- */
-enum tzbsp_encr_info_for_log_chunks_idx_t {
-	BIG_LOG_CHUNK = 0,
-	ENTIRE_LOG = 1,
-	ERR_FATAL_LOG_CHUNK = 1,
-	MAX_NUM_OF_CHUNKS,
-};
-
-struct tzbsp_encr_info_t {
-	uint32_t num_of_chunks;
-	struct tzbsp_encr_info_for_log_chunk_t chunks[MAX_NUM_OF_CHUNKS];
-	uint8_t key[TZBSP_AES_256_ENCRYPTED_KEY_SIZE];
-};
-
 /*
  * Diagnostic Table
  * Note: This is the reference data structure for tz diagnostic table
@@ -261,63 +242,29 @@ struct tzdbg_t {
 	/* Offset for Wakeup info */
 	uint32_t wakeup_info_off;
 
-	union {
-		/* The elements in below structure have to be used for TZ where
-		 * diag version = TZBSP_DIAG_MINOR_VERSION_V2
-		 */
-		struct {
+	/*
+	 * VMID to EE Mapping
+	 */
+	struct tzdbg_vmid_t vmid_info[TZBSP_DIAG_NUM_OF_VMID];
+	/*
+	 * Boot Info
+	 */
+	struct tzdbg_boot_info_t  boot_info[TZBSP_MAX_CPU_COUNT];
+	/*
+	 * Reset Info
+	 */
+	struct tzdbg_reset_info_t reset_info[TZBSP_MAX_CPU_COUNT];
+	uint32_t num_interrupts;
+	struct tzdbg_int_t  int_info[TZBSP_DIAG_INT_NUM];
 
-			/*
-			 * VMID to EE Mapping
-			 */
-			struct tzdbg_vmid_t vmid_info[TZBSP_DIAG_NUM_OF_VMID];
-			/*
-			 * Boot Info
-			 */
-			struct tzdbg_boot_info_t  boot_info[TZBSP_MAX_CPU_COUNT];
-			/*
-			 * Reset Info
-			 */
-			struct tzdbg_reset_info_t reset_info[TZBSP_MAX_CPU_COUNT];
-			uint32_t num_interrupts;
-			struct tzdbg_int_t  int_info[TZBSP_DIAG_INT_NUM];
-			/* Wake up info */
-			struct tzbsp_diag_wakeup_info_t  wakeup_info[TZBSP_MAX_CPU_COUNT];
+	/* Wake up info */
+	struct tzbsp_diag_wakeup_info_t  wakeup_info[TZBSP_MAX_CPU_COUNT];
 
-			uint8_t key[TZBSP_AES_256_ENCRYPTED_KEY_SIZE];
+	uint8_t key[TZBSP_AES_256_ENCRYPTED_KEY_SIZE];
 
-			uint8_t nonce[TZBSP_NONCE_LEN];
+	uint8_t nonce[TZBSP_NONCE_LEN];
 
-			uint8_t tag[TZBSP_TAG_LEN];
-		};
-		/* The elements in below structure have to be used for TZ where
-		 * diag version = TZBSP_DIAG_MINOR_VERSION_V21
-		 */
-		struct {
-
-			uint32_t encr_info_for_log_off;
-
-			/*
-			 * VMID to EE Mapping
-			 */
-			struct tzdbg_vmid_t vmid_info_v2[TZBSP_DIAG_NUM_OF_VMID];
-			/*
-			 * Boot Info
-			 */
-			struct tzdbg_boot_info_t  boot_info_v2[TZBSP_MAX_CPU_COUNT];
-			/*
-			 * Reset Info
-			 */
-			struct tzdbg_reset_info_t reset_info_v2[TZBSP_MAX_CPU_COUNT];
-			uint32_t num_interrupts_v2;
-			struct tzdbg_int_t  int_info_v2[TZBSP_DIAG_INT_NUM];
-
-			/* Wake up info */
-			struct tzbsp_diag_wakeup_info_t  wakeup_info_v2[TZBSP_MAX_CPU_COUNT];
-
-			struct tzbsp_encr_info_t encr_info_for_log;
-		};
-	};
+	uint8_t tag[TZBSP_TAG_LEN];
 
 	/*
 	 * We need at least 2K for the ring buffer
@@ -1085,11 +1032,16 @@ static ssize_t tzdbgfs_read_unencrypted(struct file *file, char __user *buf,
 	size_t count, loff_t *offp)
 {
 	int len = 0;
+#ifdef CONFIG_DEBUG_FS
 	int tz_id = *(int *)(file->private_data);
+#else
+	int tz_id = *(int *)(((struct seq_file *)file->private_data)->private);
+#endif
 
 	if (tz_id == TZDBG_BOOT || tz_id == TZDBG_RESET ||
 		tz_id == TZDBG_INTERRUPT || tz_id == TZDBG_GENERAL ||
-		tz_id == TZDBG_VMID || tz_id == TZDBG_LOG)
+		tz_id == TZDBG_VMID || tz_id == TZDBG_LOG ||
+		tz_id == TZDBG_QSEE_LOG)
 		memcpy_fromio((void *)tzdbg.diag_buf, tzdbg.virt_iobase,
 						debug_rw_buf_size);
 
@@ -1149,7 +1101,11 @@ static ssize_t tzdbgfs_read_encrypted(struct file *file, char __user *buf,
 	size_t count, loff_t *offp)
 {
 	int len = 0, ret = 0;
+#ifdef CONFIG_DEBUG_FS
 	int tz_id = *(int *)(file->private_data);
+#else
+	int tz_id = *(int *)(((struct seq_file *)file->private_data)->private);
+#endif
 	struct tzdbg_stat *stat = &(tzdbg.stat[tz_id]);
 
 	pr_debug("%s: tz_id = %d\n", __func__, tz_id);
@@ -1189,7 +1145,11 @@ static ssize_t tzdbgfs_read_encrypted(struct file *file, char __user *buf,
 static ssize_t tzdbgfs_read(struct file *file, char __user *buf,
 	size_t count, loff_t *offp)
 {
+#ifdef CONFIG_DEBUG_FS
 	int tz_id =  *(int *)(file->private_data);
+#else
+	int tz_id = *(int *)(((struct seq_file *)file->private_data)->private);
+#endif
 
 	if (!tzdbg.is_encrypted_log_enabled ||
 		(tz_id == TZDBG_HYP_GENERAL || tz_id == TZDBG_HYP_LOG))
@@ -1198,10 +1158,21 @@ static ssize_t tzdbgfs_read(struct file *file, char __user *buf,
 		return tzdbgfs_read_encrypted(file, buf, count, offp);
 }
 
+#ifndef CONFIG_DEBUG_FS
+static int tzdbg_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, NULL, PDE_DATA(inode));
+}
+#endif
+
 static const struct file_operations tzdbg_fops = {
 	.owner   = THIS_MODULE,
 	.read    = tzdbgfs_read,
-	.open    = simple_open,
+#ifdef CONFIG_DEBUG_FS
+	.open = simple_open,
+#else
+	.open = tzdbg_proc_open,
+#endif
 };
 
 /*
@@ -1347,6 +1318,7 @@ static void tzdbg_free_encrypted_log_buf(struct platform_device *pdev)
 
 static int  tzdbgfs_init(struct platform_device *pdev)
 {
+#ifdef CONFIG_DEBUG_FS
 	int rc = 0;
 	int i;
 	struct dentry *dent_dir;
@@ -1375,13 +1347,46 @@ err:
 	debugfs_remove_recursive(dent_dir);
 
 	return rc;
+#else
+	int rc = 0;
+	int i;
+	struct proc_dir_entry *proc_d_entry = NULL;
+
+	tzdbg_root =proc_mkdir(TZDBG_ROOT_DIR, NULL);
+	if (NULL==tzdbg_root){
+		dev_err(&pdev->dev, "Created dir /proc/%s error!\n", TZDBG_ROOT_DIR);
+		return -1;
+	}
+	dev_info(&pdev->dev, "Created dir /proc/%s\n", TZDBG_ROOT_DIR);
+
+	for (i = 0; i < TZDBG_STATS_MAX; i++) {
+		tzdbg.debug_tz[i] = i;
+		proc_d_entry = proc_create_data(tzdbg.stat[i].name, 0666, tzdbg_root, &tzdbg_fops, &	tzdbg.debug_tz[i]);
+		dev_err(&pdev->dev, "TZ proc_create_data %s failed\n", tzdbg.stat[i].name);
+		if (proc_d_entry == NULL) {
+			rc = -ENOMEM;
+			goto err;
+		}
+	}
+
+	platform_set_drvdata(pdev, tzdbg_root);
+	return 0;
+
+err:
+	remove_proc_subtree(TZDBG_ROOT_DIR, NULL);
+	return -1;
+#endif
 }
 
 static void tzdbgfs_exit(struct platform_device *pdev)
 {
+#ifdef CONFIG_DEBUG_FS
 	struct dentry *dent_dir;
 	dent_dir = platform_get_drvdata(pdev);
 	debugfs_remove_recursive(dent_dir);
+#else
+	remove_proc_subtree(TZDBG_ROOT_DIR, NULL);
+#endif
 }
 
 static int __update_hypdbg_base(struct platform_device *pdev,
@@ -1451,10 +1456,8 @@ static int tzdbg_get_tz_version(void)
 	if (
 	(((version >> TZBSP_FVER_MAJOR_SHIFT) & TZBSP_FVER_MAJOR_MINOR_MASK)
 			== TZBSP_DIAG_MAJOR_VERSION_V9) &&
-	((((version >> TZBSP_FVER_MINOR_SHIFT) & TZBSP_FVER_MAJOR_MINOR_MASK)
-			== TZBSP_DIAG_MINOR_VERSION_V2) ||
 	(((version >> TZBSP_FVER_MINOR_SHIFT) & TZBSP_FVER_MAJOR_MINOR_MASK)
-			== TZBSP_DIAG_MINOR_VERSION_V21)))
+			== TZBSP_DIAG_MINOR_VERSION_V2))
 		tzdbg.is_enlarged_buf = true;
 	else
 		tzdbg.is_enlarged_buf = false;

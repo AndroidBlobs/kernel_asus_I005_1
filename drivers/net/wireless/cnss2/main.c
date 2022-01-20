@@ -12,6 +12,14 @@
 #include <linux/suspend.h>
 #include <linux/timer.h>
 #include <soc/qcom/minidump.h>
+#include <soc/qcom/ramdump.h>
+#include <soc/qcom/subsystem_notif.h>
+#if defined ASUS_ZS673KS_PROJECT || defined ASUS_PICASSO_PROJECT
+#include <linux/gpio.h>
+#include <linux/of_gpio.h>
+#include <linux/module.h>
+#include <linux/regulator/consumer.h>
+#endif
 
 #include "main.h"
 #include "bus.h"
@@ -55,6 +63,16 @@ static struct cnss_fw_files FW_FILES_DEFAULT = {
 	"qwlan.bin", "bdwlan.bin", "otp.bin", "utf.bin",
 	"utfbd.bin", "epping.bin", "evicted.bin"
 };
+
+#if defined ASUS_ZS673KS_PROJECT || defined ASUS_PICASSO_PROJECT
+/* ASUS_BSP+++ for wifi antenna switch */
+#define default_wifi_antenna_switch		"1"
+#define GPIO_LOOKUP_STATE		"wifi_ant_gpio"
+
+int wlan_asus_ant_gpio = 0;
+/* ASUS_BSP--- for wifi antenna switch */
+#endif
+
 
 struct cnss_driver_event {
 	struct list_head list;
@@ -328,7 +346,7 @@ int cnss_set_pcie_gen_speed(struct device *dev, u8 pcie_gen_speed)
 
 	if (plat_priv->device_id != QCA6490_DEVICE_ID ||
 	    !plat_priv->fw_pcie_gen_switch)
-		return -EOPNOTSUPP;
+		return -ENOTSUPP;
 
 	if (pcie_gen_speed < QMI_PCIE_GEN_SPEED_1_V01 ||
 	    pcie_gen_speed > QMI_PCIE_GEN_SPEED_3_V01)
@@ -616,40 +634,6 @@ out:
 	return ret;
 }
 
-/**
- * cnss_get_timeout - Get timeout for corresponding type.
- * @plat_priv: Pointer to platform driver context.
- * @cnss_timeout_type: Timeout type.
- *
- * Return: Timeout in milliseconds.
- */
-unsigned int cnss_get_timeout(struct cnss_plat_data *plat_priv,
-			      enum cnss_timeout_type timeout_type)
-{
-	unsigned int qmi_timeout = cnss_get_qmi_timeout(plat_priv);
-
-	switch (timeout_type) {
-	case CNSS_TIMEOUT_QMI:
-		return qmi_timeout;
-	case CNSS_TIMEOUT_POWER_UP:
-		return (qmi_timeout << 2);
-	case CNSS_TIMEOUT_IDLE_RESTART:
-		/* In idle restart power up sequence, we have fw_boot_timer to
-		 * handle FW initialization failure.
-		 * It uses WLAN_MISSION_MODE_TIMEOUT, so setup 3x that time to
-		 * account for FW dump collection and FW re-initialization on
-		 * retry.
-		 */
-		return (qmi_timeout + WLAN_MISSION_MODE_TIMEOUT * 3);
-	case CNSS_TIMEOUT_CALIBRATION:
-		return (qmi_timeout + WLAN_COLD_BOOT_CAL_TIMEOUT);
-	case CNSS_TIMEOUT_WLAN_WATCHDOG:
-		return ((qmi_timeout << 1) + WLAN_WD_TIMEOUT_MS);
-	default:
-		return qmi_timeout;
-	}
-}
-
 unsigned int cnss_get_boot_timeout(struct device *dev)
 {
 	struct cnss_plat_data *plat_priv = cnss_bus_dev_to_plat_priv(dev);
@@ -659,7 +643,7 @@ unsigned int cnss_get_boot_timeout(struct device *dev)
 		return 0;
 	}
 
-	return cnss_get_timeout(plat_priv, CNSS_TIMEOUT_QMI);
+	return cnss_get_qmi_timeout(plat_priv);
 }
 EXPORT_SYMBOL(cnss_get_boot_timeout);
 
@@ -685,14 +669,13 @@ int cnss_power_up(struct device *dev)
 	if (plat_priv->device_id == QCA6174_DEVICE_ID)
 		goto out;
 
-	timeout = cnss_get_timeout(plat_priv, CNSS_TIMEOUT_POWER_UP);
+	timeout = cnss_get_boot_timeout(dev);
 
 	reinit_completion(&plat_priv->power_up_complete);
 	ret = wait_for_completion_timeout(&plat_priv->power_up_complete,
-					  msecs_to_jiffies(timeout));
+					  msecs_to_jiffies(timeout) << 2);
 	if (!ret) {
-		cnss_pr_err("Timeout (%ums) waiting for power up to complete\n",
-			    timeout);
+		cnss_pr_err("Timeout waiting for power up to complete\n");
 		ret = -EAGAIN;
 		goto out;
 	}
@@ -758,15 +741,20 @@ int cnss_idle_restart(struct device *dev)
 		goto out;
 	}
 
-	timeout = cnss_get_timeout(plat_priv, CNSS_TIMEOUT_IDLE_RESTART);
+	timeout = cnss_get_boot_timeout(dev);
+	/* In Idle restart power up sequence, we have fw_boot_timer to handle
+	 * FW initialization failure. It uses WLAN_DRIVER_LOAD_TIMEOUT.
+	 * Thus setup 3x that completion wait time to account for FW reinit /
+	 * dump collection on retry.
+	 */
 	ret = wait_for_completion_timeout(&plat_priv->power_up_complete,
-					  msecs_to_jiffies(timeout));
+					  msecs_to_jiffies(timeout +
+					  WLAN_MISSION_MODE_TIMEOUT * 3));
 	if (!ret) {
 		/* This exception occurs after attempting retry of FW recovery.
 		 * Thus we can safely power off the device.
 		 */
-		cnss_fatal_err("Timeout (%ums) waiting for idle restart to complete\n",
-			       timeout);
+		cnss_fatal_err("Timeout for idle restart to complete\n");
 		ret = -ETIMEDOUT;
 		cnss_power_down(dev);
 		CNSS_ASSERT(0);
@@ -814,8 +802,7 @@ int cnss_idle_shutdown(struct device *dev)
 	ret = wait_for_completion_timeout(&plat_priv->recovery_complete,
 					  msecs_to_jiffies(RECOVERY_TIMEOUT));
 	if (!ret) {
-		cnss_pr_err("Timeout (%ums) waiting for recovery to complete\n",
-			    RECOVERY_TIMEOUT);
+		cnss_pr_err("Timeout waiting for recovery to complete\n");
 		CNSS_ASSERT(0);
 	}
 
@@ -1075,8 +1062,6 @@ static void cnss_recovery_work_handler(struct work_struct *work)
 #else
 static void cnss_recovery_work_handler(struct work_struct *work)
 {
-	int ret;
-
 	struct cnss_plat_data *plat_priv =
 		container_of(work, struct cnss_plat_data, recovery_work);
 
@@ -1090,7 +1075,6 @@ static void cnss_recovery_work_handler(struct work_struct *work)
 	ret = cnss_bus_dev_powerup(plat_priv);
 	if (ret)
 		__pm_relax(plat_priv->recovery_ws);
-
 	return;
 }
 
@@ -1382,13 +1366,8 @@ wait_rddm:
 	ret = wait_for_completion_timeout
 		(&plat_priv->rddm_complete,
 		 msecs_to_jiffies(CNSS_RDDM_TIMEOUT_MS));
-	if (!ret) {
-		cnss_pr_err("Timeout (%ums) waiting for RDDM to complete\n",
-			    CNSS_RDDM_TIMEOUT_MS);
+	if (!ret)
 		ret = -ETIMEDOUT;
-	} else if (ret > 0) {
-		ret = 0;
-	}
 
 	return ret;
 }
@@ -2226,7 +2205,6 @@ int cnss_register_ramdump(struct cnss_plat_data *plat_priv)
 	case QCA6290_DEVICE_ID:
 	case QCA6390_DEVICE_ID:
 	case QCA6490_DEVICE_ID:
-	case WCN7850_DEVICE_ID:
 		ret = cnss_register_ramdump_v2(plat_priv);
 		break;
 	default:
@@ -2246,7 +2224,6 @@ void cnss_unregister_ramdump(struct cnss_plat_data *plat_priv)
 	case QCA6290_DEVICE_ID:
 	case QCA6390_DEVICE_ID:
 	case QCA6490_DEVICE_ID:
-	case WCN7850_DEVICE_ID:
 		cnss_unregister_ramdump_v2(plat_priv);
 		break;
 	default:
@@ -2761,7 +2738,6 @@ static const struct platform_device_id cnss_platform_id_table[] = {
 	{ .name = "qca6290", .driver_data = QCA6290_DEVICE_ID, },
 	{ .name = "qca6390", .driver_data = QCA6390_DEVICE_ID, },
 	{ .name = "qca6490", .driver_data = QCA6490_DEVICE_ID, },
-	{ .name = "wcn7850", .driver_data = WCN7850_DEVICE_ID, },
 	{ },
 };
 
@@ -2778,9 +2754,6 @@ static const struct of_device_id cnss_of_match_table[] = {
 	{
 		.compatible = "qcom,cnss-qca6490",
 		.data = (void *)&cnss_platform_id_table[3]},
-	{
-		.compatible = "qcom,cnss-wcn7850",
-		.data = (void *)&cnss_platform_id_table[4]},
 	{ },
 };
 MODULE_DEVICE_TABLE(of, cnss_of_match_table);
@@ -2792,12 +2765,51 @@ cnss_use_nv_mac(struct cnss_plat_data *plat_priv)
 				     "use-nv-mac");
 }
 
+/* ASUS_BSP--- for for wifi antenna switch*/
+#if defined ASUS_ZS673KS_PROJECT || defined ASUS_PICASSO_PROJECT
+static ssize_t do_wifi_antenna_switch_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	int antenna_gpio = 0;
+	struct pinctrl *key_pinctrl;
+
+	kstrtoint(buf,10,&antenna_gpio);
+
+	key_pinctrl = devm_pinctrl_get(dev);
+	if (IS_ERR_OR_NULL(key_pinctrl)) {
+	    pr_err("[cnss] get_pinctrl failed");
+	}
+
+	cnss_pr_info("[cnss]: wifi_antenna_switch_start = %d, GPIO = %d.\n", antenna_gpio, gpio_get_value(wlan_asus_ant_gpio));
+
+	gpio_set_value(wlan_asus_ant_gpio, antenna_gpio);
+
+	cnss_pr_info("[cnss]: wifi_antenna_switch_end GPIO = %d.\n", gpio_get_value(wlan_asus_ant_gpio));
+
+	return count;
+
+}
+
+static DEVICE_ATTR(do_wifi_antenna_switch, 0644, NULL, do_wifi_antenna_switch_store);
+#endif
+/* ASUS_BSP--- for for wifi antenna switch*/
+
 static int cnss_probe(struct platform_device *plat_dev)
 {
 	int ret = 0;
 	struct cnss_plat_data *plat_priv;
 	const struct of_device_id *of_id;
 	const struct platform_device_id *device_id;
+	/* ASUS_BSP+++ "add for the antenna switch power (LDO13A)" */
+#if defined ASUS_ZS673KS_PROJECT || defined ASUS_PICASSO_PROJECT
+	struct device *dev;
+//	struct regulator *temp_reg;
+//	int rc = 0;
+
+	struct pinctrl *key_pinctrl;
+	struct pinctrl_state *set_state;
+#endif
+	/* ASUS_BSP--- "add for the antenna switch power (LDO13A)" */
 
 	if (cnss_get_plat_priv(plat_dev)) {
 		cnss_pr_err("Driver is already initialized!\n");
@@ -2890,6 +2902,56 @@ static int cnss_probe(struct platform_device *plat_dev)
 	ret = cnss_genl_init();
 	if (ret < 0)
 		cnss_pr_err("CNSS genl init failed %d\n", ret);
+
+	/* ASUS_BSP+++ "add for the antenna switch power (LDO13A)" */
+#if defined ASUS_ZS673KS_PROJECT || defined ASUS_PICASSO_PROJECT
+dev = &plat_priv->plat_dev->dev;
+	key_pinctrl = devm_pinctrl_get(dev);
+	if (IS_ERR_OR_NULL(key_pinctrl)) {
+		cnss_pr_err("[cnss] set_pinctrl failed");
+	}
+
+	set_state = pinctrl_lookup_state(key_pinctrl, GPIO_LOOKUP_STATE);
+	ret = pinctrl_select_state(key_pinctrl, set_state);
+	if(ret < 0)
+		cnss_pr_err("[cnss] pinctrl_select_state");
+
+	ret = device_create_file(&plat_dev->dev, &dev_attr_do_wifi_antenna_switch);
+	if (ret)
+		pr_err("[cnss]: sysfs node create failed error:%d\n", ret);
+
+#if defined ASUS_ZS673KS_PROJECT
+	wlan_asus_ant_gpio = of_get_named_gpio(dev->of_node,"wlan-asus_ant_141",0);
+#else
+	wlan_asus_ant_gpio = of_get_named_gpio(dev->of_node,"wlan-asus_ant_148",0);
+#endif
+	if (wlan_asus_ant_gpio < 0) {
+		pr_err("[cnss] no wlan-asus_ant_gpio \n");
+	}
+	printk("[cnss] asus_ant_gpio = %d\n", wlan_asus_ant_gpio);
+
+	if (gpio_is_valid (wlan_asus_ant_gpio)) {
+#if defined ASUS_ZS673KS_PROJECT
+		ret = gpio_request(wlan_asus_ant_gpio, "wlan-asus_ant_141");
+#else
+		ret = gpio_request(wlan_asus_ant_gpio, "wlan-asus_ant_148");
+#endif
+		if (ret){
+			printk("[cnss] gpio_request.err %d\n", ret);
+		}
+		ret = gpio_direction_output(wlan_asus_ant_gpio, 1);
+		if (ret){
+			printk("[cnss] gpio_direction_output.err %d\n", ret);
+		}
+		gpio_set_value(wlan_asus_ant_gpio, 1);
+		printk("[cnss] gpio_get_value_end %d\n", gpio_get_value(wlan_asus_ant_gpio));
+	}
+	else {
+		printk("[cnss] wlan_asus_ant_gpio is not valid");
+	}
+#endif
+	/* ASUS_BSP--- "add for the antenna switch power (LDO13A)" */
+
 
 	cnss_pr_info("Platform driver probed successfully.\n");
 

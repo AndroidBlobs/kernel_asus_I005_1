@@ -85,8 +85,7 @@ static struct bt_power_vreg_data bt_vregs_info_qca6x9x[] = {
 		{BT_VDD_RFA1_LDO, BT_VDD_RFA1_LDO_CURRENT}},
 	{NULL, "qcom,bt-vdd-rfa2",     1900000, 1900000, 0, false, true,
 		{BT_VDD_RFA2_LDO, BT_VDD_RFA2_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-asd",      2800000, 2800000, 0, false, true,
-		{BT_VDD_ASD_LDO, BT_VDD_ASD_LDO_CURRENT}},
+       {NULL, "qcom,bt-vdd-asd", 2800000, 2800000, 0, false, true},
 };
 
 // Regulator structure for WCN399x BT SoC series
@@ -257,13 +256,11 @@ static int bt_clk_enable(struct bt_power_clk_data *clk)
 
 	pr_debug("%s: %s\n", __func__, clk->name);
 
-	if (!clk->clk)
-		return -EINVAL;
 	/* Get the clock handle for vreg */
-	if (clk->is_enabled) {
-		pr_warning("%s: node: %p, clk->is_enabled:%d\n",
-			   __func__, clk->clk, clk->is_enabled);
-		return 0;
+	if (!clk->clk || clk->is_enabled) {
+		pr_err("%s: error - node: %p, clk->is_enabled:%d\n",
+			__func__, clk->clk, clk->is_enabled);
+		return -EINVAL;
 	}
 
 	rc = clk_prepare_enable(clk->clk);
@@ -283,13 +280,11 @@ static int bt_clk_disable(struct bt_power_clk_data *clk)
 
 	pr_debug("%s: %s\n", __func__, clk->name);
 
-	if (!clk->clk)
-		return -EINVAL;
 	/* Get the clock handle for vreg */
-	if (!clk->is_enabled) {
-		pr_warning("%s: node: %p, clk->is_enabled:%d\n",
-			   __func__, clk->clk, clk->is_enabled);
-		return 0;
+	if (!clk->clk || !clk->is_enabled) {
+		pr_err("%s: error - node: %p, clk->is_enabled:%d\n",
+			__func__, clk->clk, clk->is_enabled);
+		return -EINVAL;
 	}
 	clk_disable_unprepare(clk->clk);
 
