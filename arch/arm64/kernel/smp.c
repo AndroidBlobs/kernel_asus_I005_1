@@ -932,7 +932,7 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 		break;
 
 	case IPI_CPU_STOP:
-		trace_android_vh_ipi_stop_rcuidle(regs);
+		trace_android_vh_ipi_stop(regs);
 		irq_enter();
 		local_cpu_stop();
 		irq_exit();
